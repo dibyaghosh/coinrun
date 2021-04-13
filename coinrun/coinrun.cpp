@@ -86,6 +86,7 @@ const int MAX_MAZE_DIFFICULTY = 4;
 bool USE_LEVEL_SET = false;
 int NUM_LEVELS = 0;
 int *LEVEL_SEEDS;
+int last_seed = 0;
 
 bool RANDOM_TILE_COLORS = false;
 bool PAINT_VEL_INFO = false;
@@ -188,6 +189,7 @@ public:
   }
 
   void seed(int seed) {
+    last_seed = seed;
     stdgen.seed(seed);
     is_seeded = true;
   }
@@ -241,6 +243,7 @@ public:
   int* walls;
   int coins;
   bool is_terminated;
+  bool is_dead;
 
   float gravity;
   float max_jump;
@@ -260,6 +263,7 @@ public:
     game_type = _game_type;
     walls = new int[w*h];
     is_terminated = false;
+    is_dead = false;
     coins = 0;
   }
 
@@ -1143,6 +1147,7 @@ struct Agent {
   uint8_t render_buf[RES_W*RES_H*4];
   uint8_t* render_hires_buf = 0;
   bool game_over = false;
+  int num_deaths = 0;
   float reward = 0;
   float reward_sum = 0;
   bool is_facing_right;
@@ -1199,12 +1204,24 @@ struct Agent {
     is_facing_right = true;
   }
 
+  void reset_samelevel(int spawn_n) {
+    x = maze->spawnpos[0];
+    y = maze->spawnpos[1];
+    action_dx = 0;
+    action_dy = 0;
+    // time_alive = 0;
+    reward_sum = 0;
+    vx = vy = spring = 0;
+    is_facing_right = true;
+  }
+
   void eat_coin(int x, int y)
   {
     int obj = maze->get_elem(x, y);
 
     if (is_lethal(obj)) {
       maze->is_terminated = true;
+      maze->is_dead = true;
     }
 
     if (is_coin(obj)) {
@@ -1424,6 +1441,7 @@ void Monster::step(const std::shared_ptr<Maze>& maze)
 struct State {
   int state_n; // in vstate
   std::shared_ptr<Maze> maze;
+  int last_seed = 0;
   int ground_n;
   int bg_n;
   State(const std::shared_ptr<VectorOfStates>& belongs_to):
@@ -1439,20 +1457,9 @@ struct State {
    bool agent_ready = false;
 };
 
-void state_reset(const std::shared_ptr<State>& state, int game_type)
-{
-  assert(player_themesl.size() > 0 && "Please call init(threads) first");
-
+void state_reset_to_beginning(const std::shared_ptr<State>& state, int game_type){
   int level_seed = 0;
-
-  if (USE_LEVEL_SET) {
-    int level_index = global_rand_gen.randint(0, NUM_LEVELS);
-    level_seed = LEVEL_SEEDS[level_index];
-  } else if (NUM_LEVELS > 0) {
-    level_seed = global_rand_gen.randint(0, NUM_LEVELS);
-  } else {
-    level_seed = global_rand_gen.randint();
-  }
+  level_seed = state->last_seed;
 
   RandomMazeGenerator maze_gen;
   maze_gen.rand_gen.seed(level_seed);
@@ -1480,6 +1487,64 @@ void state_reset(const std::shared_ptr<State>& state, int game_type)
   agent.maze = state->maze;
   agent.zoom = zoom;
   agent.target_zoom = zoom;
+  // New stuff
+  agent.num_deaths++;
+  // End new stuff
+
+  agent.theme_n = maze_gen.randn(player_themesl.size());
+  state->ground_n = maze_gen.randn(ground_themes.size());
+  state->bg_n = maze_gen.randn(bg_images.size());
+
+  agent.reset_samelevel(0);
+
+  state->maze->is_terminated = false;
+  state->maze->is_dead = false;
+  // state->time = 0;
+}
+void state_reset(const std::shared_ptr<State>& state, int game_type)
+{
+  assert(player_themesl.size() > 0 && "Please call init(threads) first");
+
+  int level_seed = 0;
+  if (USE_LEVEL_SET) {
+    int level_index = global_rand_gen.randint(0, NUM_LEVELS);
+    level_seed = LEVEL_SEEDS[level_index];
+  } else if (NUM_LEVELS > 0) {
+    level_seed = global_rand_gen.randint(0, NUM_LEVELS);
+  } else {
+    level_seed = global_rand_gen.randint();
+  }
+
+  RandomMazeGenerator maze_gen;
+  maze_gen.rand_gen.seed(level_seed);
+  state->last_seed = level_seed;
+
+  int w = 64;
+  int h = 64;
+  state->maze.reset(new Maze(w, h, game_type));
+  maze_gen.maze = state->maze;
+
+  maze_gen.initial_floor_and_walls(game_type);
+
+  if (game_type==CoinRunPlatforms_v0) {
+    maze_gen.generate_coins_on_platforms();
+  } else if (game_type == CoinRunToTheRight_v0) {
+    maze_gen.generate_coin_to_the_right(game_type);
+  } else if (game_type == CoinRunMaze_v0) {
+    maze_gen.generate_coin_maze();
+  } else {
+    fprintf(stderr, "coinrun: unknown game type %i\n", game_type);
+    maze_gen.generate_test_level();
+  }
+
+  Agent &agent = state->agent;
+  float zoom = state->maze->default_zoom;
+  agent.maze = state->maze;
+  agent.zoom = zoom;
+  agent.target_zoom = zoom;
+  // New stuff
+  agent.num_deaths = 0;
+  // ENd new stuff
 
   agent.theme_n = maze_gen.randn(player_themesl.size());
   state->ground_n = maze_gen.randn(ground_themes.size());
@@ -1488,6 +1553,7 @@ void state_reset(const std::shared_ptr<State>& state, int game_type)
   agent.reset(0);
 
   state->maze->is_terminated = false;
+  state->maze->is_dead = false;
   state->time = 0;
 }
 
@@ -1754,23 +1820,28 @@ void stepping_thread(int n)
       if (!belongs_to)
         continue;
       todo_state->time += 1;
-      bool game_over = todo_state->maze->is_terminated;
+      // bool game_over = todo_state->maze->is_terminated;
 
       for (const std::shared_ptr<Monster>& m: todo_state->maze->monsters) {
         m->step(todo_state->maze);
         Agent& a = todo_state->agent;
-        if (fabs(m->x - a.x) + fabs(m->y - a.y) < 1.0)
+        if (fabs(m->x - a.x) + fabs(m->y - a.y) < 1.0){
           todo_state->maze->is_terminated = true;  // no effect on agent score
+          todo_state->maze->is_dead = true;  // no effect on agent score
+        }
       }
-
+      bool game_over = todo_state->maze->is_terminated;
       Agent& a = todo_state->agent;
       if (game_over)
         a.monitor_csv_episode_over();
-      a.game_over = game_over;
+      a.game_over = false;
       a.step(belongs_to->game_type);
-
-      if (game_over) {
+      if (todo_state->maze->is_dead && a.num_deaths < 3){
+        state_reset_to_beginning(todo_state, belongs_to->game_type);
+      }
+      else if (game_over) {
         state_reset(todo_state, belongs_to->game_type);
+        a.game_over = true;
       }
 
       paint_render_buf(a.render_buf, RES_W, RES_H, todo_state, &a, false, false);
